@@ -1,0 +1,52 @@
+# AgeCode Bridge: sends paid AgeCode orders from Alpha BioMed (Shopify) to Genetic LifeSpan.
+# `npm run config:link` fills in client_id / name and links this file to the app in the Dev Dashboard.
+client_id = ""
+name = "AgeCode Bridge"
+# Replace with the Render URL (e.g. https://agecode-bridge.onrender.com) before `npm run deploy`.
+application_url = "https://agecode-bridge.onrender.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
+[access_scopes]
+# read_orders/write_orders: load paid orders, add gls-* tags and the gls.sync metafield
+# read_products: read the gls.product_type variant metafield
+# *_merchant_managed_fulfillment_orders: mark AgeCode items fulfilled so ShipStation skips them
+# read_customers: customer phone/email fallback when the order has none
+scopes = "read_orders,write_orders,read_products,read_customers,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders"
+
+[auth]
+redirect_urls = [ "https://agecode-bridge.onrender.com/auth/callback" ]
+
+[webhooks]
+api_version = "2026-10"
+
+  # Handled by: /app/routes/webhooks.app.uninstalled.tsx
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  # Handled by: /app/routes/webhooks.app.scopes_update.tsx
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+  # Handled by: /app/routes/webhooks.orders.paid.tsx (queues the order for Genetic LifeSpan)
+  [[webhooks.subscriptions]]
+  topics = [ "orders/paid" ]
+  uri = "/webhooks/orders/paid"
+
+  # Handled by: /app/routes/webhooks.orders.cancelled.tsx (alert if already sent)
+  [[webhooks.subscriptions]]
+  topics = [ "orders/cancelled" ]
+  uri = "/webhooks/orders/cancelled"
+
+  # Handled by: /app/routes/webhooks.refunds.create.tsx (alert if already sent)
+  [[webhooks.subscriptions]]
+  topics = [ "refunds/create" ]
+  uri = "/webhooks/refunds/create"
+
+[pos]
+embedded = false

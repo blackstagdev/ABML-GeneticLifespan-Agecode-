@@ -1,0 +1,93 @@
+// AgeCode Bridge database (PostgreSQL on Render).
+// See https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Shopify sessions (from the app template)
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// One job per paid Shopify order. Created by the orders/paid webhook, processed by the worker.
+//
+// status:
+//   pending     - waiting to be processed
+//   processing  - claimed by the worker (lockedAt set)
+//   retry       - a temporary failure; will run again at nextAttemptAt
+//   done        - every AgeCode line was sent to GLS (and fulfilled when AUTO_FULFILL is on)
+//   dry_run     - payloads were built but not sent (GLS_MODE=dry_run)
+//   no_agecode  - the order has no AgeCode line items
+//   cancelled   - the order was cancelled before it could be sent
+//   failed      - needs a person: permanent error or retries used up
+model OrderJob {
+  id            String    @id @default(cuid())
+  shop          String
+  orderGid      String    @unique
+  orderName     String?
+  status        String    @default("pending")
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  lockedAt      DateTime?
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lines         GlsSync[]
+
+  @@index([status, nextAttemptAt])
+  @@index([createdAt])
+}
+
+// One row per AgeCode line item sent (or to be sent) to Genetic LifeSpan.
+//
+// status: pending | sent | dry_run | failed
+model GlsSync {
+  id             String    @id @default(cuid())
+  jobId          String
+  job            OrderJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  orderGid       String
+  orderName      String
+  lineItemGid    String
+  alphaOrderId   String
+  productType    String
+  quantity       Int
+  pricePaid      Decimal   @db.Decimal(12, 2)
+  status         String    @default("pending")
+  retryable      Boolean   @default(true)
+  attempts       Int       @default(0)
+  lastError      String?
+  lastStatusCode Int?
+  requestPayload Json
+  responseBody   Json?
+  glsOrderId     String?
+  glsOrderName   String?
+  sentAt         DateTime?
+  fulfilledAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([orderGid, lineItemGid])
+  @@index([sentAt])
+}

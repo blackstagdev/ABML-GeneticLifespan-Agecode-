@@ -1,0 +1,56 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# New > Blueprint > pick this repo. Values marked `sync: false` are entered in the Render dashboard.
+services:
+  - type: web
+    name: agecode-bridge
+    runtime: node
+    # Starter or above: the free plan sleeps, so Shopify webhooks would time out on cold starts.
+    plan: starter
+    region: oregon
+    buildCommand: npm ci && npx prisma generate && npm run build
+    preDeployCommand: npx prisma migrate deploy
+    startCommand: npm run start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agecode-bridge-db
+          property: connectionString
+      # From the app in the Shopify Dev Dashboard (Client ID / Secret)
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      # This service's public URL, e.g. https://agecode-bridge.onrender.com
+      - key: SHOPIFY_APP_URL
+        sync: false
+      - key: SCOPES
+        value: read_orders,write_orders,read_products,read_customers,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders
+      # dry_run until Genetic LifeSpan delivers the API key; then GLS_API_KEY + GLS_MODE=live
+      - key: GLS_MODE
+        value: dry_run
+      - key: GLS_API_KEY
+        sync: false
+      - key: GLS_CHANNEL_ID
+        value: alpha-biomed
+      - key: GLS_PRICE_MODE
+        value: line_total
+      - key: AUTO_FULFILL
+        value: "true"
+      # Optional failure alerts
+      - key: ALERT_WEBHOOK_URL
+        sync: false
+      - key: ALERT_EMAIL_TO
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+
+databases:
+  - name: agecode-bridge-db
+    plan: basic-256mb
+    region: oregon
+    databaseName: agecode_bridge
+    user: agecode_bridge
