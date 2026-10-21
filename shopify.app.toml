@@ -1,6 +1,6 @@
 # AgeCode Bridge: sends paid AgeCode orders from Alpha BioMed (Shopify) to Genetic LifeSpan.
 # `npm run config:link` fills in client_id / name and links this file to the app in the Dev Dashboard.
-client_id = ""
+client_id = "fac839edaf1ce11b58d8185ee16f8934"
 name = "AgeCode Bridge"
 # Replace with the Render URL (e.g. https://agecode-bridge.onrender.com) before `npm run deploy`.
 application_url = "https://agecode-bridge.onrender.com"
