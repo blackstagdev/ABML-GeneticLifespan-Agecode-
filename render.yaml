@@ -8,7 +8,8 @@ services:
     plan: starter
     region: oregon
     buildCommand: npm ci && npx prisma generate && npm run build
-    preDeployCommand: npx prisma migrate deploy
+    # Retries for ~2 minutes: the database can be briefly unreachable while the deploy starts.
+    preDeployCommand: for i in 1 2 3 4 5 6 7 8; do npx prisma migrate deploy && exit 0; echo "Database not reachable yet, retrying in 15s ($i/8)"; sleep 15; done; exit 1
     startCommand: npm run start
     healthCheckPath: /healthz
     autoDeploy: true
