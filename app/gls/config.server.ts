@@ -2,15 +2,14 @@
 // See .env.example for the full list.
 
 export type GlsMode = "live" | "dry_run" | "mock";
-export type PriceMode = "line_total" | "unit";
 
 export interface GlsConfig {
   mode: GlsMode;
   apiBase: string;
   channelId: string;
   apiKey: string;
-  priceMode: PriceMode;
-  appendAddress2: boolean;
+  // send every order in the V2 test format (TEST- prefix, first name TEST)
+  forceTest: boolean;
   autoFulfill: boolean;
   maxAttempts: number;
   requestTimeoutMs: number;
@@ -44,11 +43,11 @@ export function getGlsConfig(env: NodeJS.ProcessEnv = process.env): GlsConfig {
         : (env.GLS_API_BASE || "https://gls-channel-api.geneticlifespan.com").replace(/\/$/, ""),
     channelId: env.GLS_CHANNEL_ID || "alpha-biomed",
     apiKey: mode === "mock" ? MOCK_API_KEY : env.GLS_API_KEY || "",
-    priceMode: env.GLS_PRICE_MODE === "unit" ? "unit" : "line_total",
-    appendAddress2: bool(env.GLS_APPEND_ADDRESS2, true),
+    forceTest: bool(env.GLS_TEST_ORDERS, false),
     autoFulfill: bool(env.AUTO_FULFILL, true),
     maxAttempts: Number(env.GLS_MAX_ATTEMPTS) || 6,
-    requestTimeoutMs: Number(env.GLS_TIMEOUT_MS) || 15000,
+    // Generous: a timeout leaves the order in "needs check" (the API can't be retried safely).
+    requestTimeoutMs: Number(env.GLS_TIMEOUT_MS) || 30000,
     alertWebhookUrl: env.ALERT_WEBHOOK_URL || "",
     alertEmailTo: env.ALERT_EMAIL_TO || "",
     resendApiKey: env.RESEND_API_KEY || "",
@@ -57,6 +56,7 @@ export function getGlsConfig(env: NodeJS.ProcessEnv = process.env): GlsConfig {
 }
 
 // Minutes to wait before attempt N+1 (index = attempts already made - 1).
+// Only used for failures where nothing reached Genetic LifeSpan (Shopify API errors, DNS, 429).
 export const RETRY_BACKOFF_MINUTES = [1, 5, 30, 120, 360];
 
 export function nextAttemptDelayMs(attempts: number) {

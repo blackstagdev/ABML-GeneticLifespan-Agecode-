@@ -1,15 +1,20 @@
-// Order processing: Shopify order -> GLS API -> fulfill + tag the AgeCode items.
+// Order processing: Shopify order -> one GLS order -> fulfill + tag the AgeCode items.
+//
+// Genetic LifeSpan's API does not dedupe, so a request is never repeated unless we know it
+// didn't create anything (4xx, DNS/connection refused, 429). A 5xx or timeout puts the order in
+// "needs_check" until someone confirms with Genetic LifeSpan and presses "Mark as sent" or "Resend".
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import { sendAlert } from "./alerts.server";
 import { sendGlsOrder } from "./client.server";
 import { getGlsConfig, nextAttemptDelayMs, type GlsConfig } from "./config.server";
-import { buildGlsLines } from "./payload";
+import { buildGlsOrder, describeItems, type BuiltItem } from "./payload";
 import { addOrderTags, fulfillOrderLines, loadOrder, setSyncMetafield } from "./shopify-order.server";
 
 export const TAGS = {
   sent: "gls-sent",
   error: "gls-error",
+  check: "gls-check",
   dryRun: "gls-dry-run",
 } as const;
 
@@ -18,20 +23,37 @@ const STALE_LOCK_MS = 10 * 60 * 1000;
 const shortError = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 1000);
 
 export async function enqueueOrder(shop: string, orderGid: string, orderName?: string | null) {
-  const job = await prisma.orderJob.upsert({
+  return prisma.orderJob.upsert({
     where: { orderGid },
     create: { shop, orderGid, orderName: orderName ?? null },
     update: {},
   });
-  return job;
 }
 
-// Puts a job back in the queue (used by the Retry button and the manual "queue order" form).
-export async function requeueJob(jobId: string) {
-  await prisma.glsSync.updateMany({
-    where: { jobId, status: "failed" },
-    data: { status: "pending", retryable: true, lastError: null },
+// Puts a job back in the queue (Retry/Send buttons, "Queue order").
+// `resend` is only for orders Genetic LifeSpan confirmed they don't have (needs_check).
+export async function requeueJob(jobId: string, { resend = false } = {}) {
+  const sync = await prisma.glsSync.findUnique({ where: { jobId } });
+  if (sync && sync.status !== "sent") {
+    if (["needs_check", "sending"].includes(sync.status) && !resend) {
+      throw new Error("This order may already exist at Genetic LifeSpan. Confirm with them first.");
+    }
+    // Rebuild the payload from the current order (picks up fixes such as a corrected phone number).
+    await prisma.glsSync.delete({ where: { id: sync.id } });
+  }
+  return prisma.orderJob.update({
+    where: { id: jobId },
+    data: { status: "retry", attempts: 0, nextAttemptAt: new Date(), lastError: null, lockedAt: null },
   });
+}
+
+// After Genetic LifeSpan confirms an order from a needs_check row exists on their side.
+export async function markSentManually(jobId: string, glsOrderName: string) {
+  await prisma.glsSync.update({
+    where: { jobId },
+    data: { status: "sent", glsOrderName: glsOrderName || "confirmed by Genetic LifeSpan", sentAt: new Date(), lastError: null },
+  });
+  // Let the worker finish the Shopify side (fulfill, tag, metafield).
   return prisma.orderJob.update({
     where: { id: jobId },
     data: { status: "retry", attempts: 0, nextAttemptAt: new Date(), lastError: null, lockedAt: null },
@@ -75,14 +97,15 @@ export async function processJob(jobId: string) {
     const outcome = await runJob(job.shop, job.id, job.orderGid, config);
     await finishJob(job.id, job.orderName, attempts, outcome, config);
   } catch (error) {
-    // Unexpected error (Shopify API down, DB error...): retry the whole job.
+    // Unexpected error (Shopify API down, DB error...). The GLS request is protected by the
+    // "sending" status, so retrying the job can't create a duplicate.
     await finishJob(job.id, job.orderName, attempts, { status: "retryable_error", error: shortError(error) }, config);
   }
 }
 
 type Outcome =
   | { status: "done" | "dry_run" | "no_agecode" | "cancelled" }
-  | { status: "retryable_error" | "permanent_error"; error: string };
+  | { status: "retryable_error" | "permanent_error" | "needs_check"; error: string };
 
 async function runJob(shop: string, jobId: string, orderGid: string, config: GlsConfig): Promise<Outcome> {
   const { admin } = await unauthenticated.admin(shop);
@@ -91,139 +114,126 @@ async function runJob(shop: string, jobId: string, orderGid: string, config: Gls
 
   await prisma.orderJob.update({ where: { id: jobId }, data: { orderName: order.name } });
 
-  const built = buildGlsLines(order, config);
-  if (!built.length) return { status: "no_agecode" };
+  let sync = await prisma.glsSync.findUnique({ where: { jobId } });
 
-  // Record every AgeCode line (idempotent: one row per order line item).
-  for (const line of built) {
-    await prisma.glsSync.upsert({
-      where: { orderGid_lineItemGid: { orderGid, lineItemGid: line.lineItemId } },
-      create: {
+  if (!sync) {
+    const built = buildGlsOrder(order, { forceTest: config.forceTest });
+    if (!built) return { status: "no_agecode" };
+    sync = await prisma.glsSync.create({
+      data: {
         jobId,
         orderGid,
         orderName: order.name,
-        lineItemGid: line.lineItemId,
-        alphaOrderId: line.alphaOrderId,
-        productType: line.productType,
-        quantity: line.quantity,
-        pricePaid: line.pricePaid,
-        requestPayload: (line.payload ?? { errors: line.errors }) as object,
+        alphaOrderId: built.alphaOrderId,
+        isTest: built.isTest,
+        items: built.items as unknown as object,
+        summary: describeItems(built.items),
+        pricePaid: built.pricePaid,
+        status: built.payload ? "pending" : "failed",
+        lastError: built.errors.length ? built.errors.join("; ") : null,
+        requestPayload: (built.payload ?? { errors: built.errors }) as object,
       },
-      update: {},
     });
   }
 
-  const rows = await prisma.glsSync.findMany({ where: { jobId } });
-  const unsent = rows.filter((row) => row.status !== "sent");
+  // A previous run died between saving "sending" and saving the answer: never resend blindly.
+  if (sync.status === "sending") {
+    sync = await prisma.glsSync.update({
+      where: { id: sync.id },
+      data: { status: "needs_check", lastError: "The app stopped while sending. Check with Genetic LifeSpan." },
+    });
+  }
 
-  if (unsent.length && order.cancelled) return { status: "cancelled" };
+  if (sync.status === "failed") return { status: "permanent_error", error: sync.lastError ?? "Order data invalid" };
+  if (sync.status === "needs_check") return { status: "needs_check", error: sync.lastError ?? "Check with Genetic LifeSpan" };
 
-  // Send every line that hasn't been accepted by GLS yet.
-  for (const row of unsent) {
-    const line = built.find((candidate) => candidate.lineItemId === row.lineItemGid);
-    if (!line) continue;
+  if (["pending", "dry_run"].includes(sync.status)) {
+    if (order.cancelled) return { status: "cancelled" };
 
-    if (!line.payload) {
-      await prisma.glsSync.update({
-        where: { id: row.id },
-        data: {
-          status: "failed",
-          retryable: false,
-          attempts: { increment: 1 },
-          lastError: line.errors.join("; "),
-          requestPayload: { errors: line.errors },
-        },
-      });
-      continue;
+    if (config.mode !== "dry_run") {
+      // Persist intent first so a crash mid-request can't lead to a second POST.
+      await prisma.glsSync.update({ where: { id: sync.id }, data: { status: "sending", attempts: { increment: 1 } } });
     }
 
-    const result = await sendGlsOrder(config, line.payload);
-    const base = { attempts: { increment: 1 }, requestPayload: line.payload as object };
+    const result = await sendGlsOrder(config, sync.requestPayload as never);
 
-    if (result.kind === "sent") {
+    if (result.kind === "dry_run") {
+      await prisma.glsSync.update({ where: { id: sync.id }, data: { status: "dry_run" } });
+      await addOrderTags(admin, orderGid, [TAGS.dryRun]);
+      return { status: "dry_run" };
+    }
+    if (result.kind === "not_sent") {
       await prisma.glsSync.update({
-        where: { id: row.id },
-        data: {
-          ...base,
-          status: "sent",
-          retryable: false,
-          lastError: null,
-          lastStatusCode: result.status,
-          responseBody: result.body as object,
-          glsOrderId: result.glsOrderId,
-          glsOrderName: result.glsOrderName,
-          sentAt: new Date(),
-        },
+        where: { id: sync.id },
+        data: { status: "pending", lastError: result.message, lastStatusCode: result.status },
       });
-    } else if (result.kind === "dry_run") {
+      return { status: "retryable_error", error: result.message };
+    }
+    if (result.kind === "rejected") {
       await prisma.glsSync.update({
-        where: { id: row.id },
-        data: { ...base, status: "dry_run", lastError: null },
-      });
-    } else {
-      await prisma.glsSync.update({
-        where: { id: row.id },
+        where: { id: sync.id },
         data: {
-          ...base,
           status: "failed",
-          retryable: result.retryable,
           lastError: result.message.slice(0, 1000),
           lastStatusCode: result.status,
           responseBody: (result.body ?? null) as object,
         },
       });
+      return { status: "permanent_error", error: `Genetic LifeSpan rejected the order (${result.status}): ${result.message}` };
     }
-  }
+    if (result.kind === "unknown") {
+      await prisma.glsSync.update({
+        where: { id: sync.id },
+        data: {
+          status: "needs_check",
+          lastError: result.message.slice(0, 1000),
+          lastStatusCode: result.status,
+          responseBody: (result.body ?? null) as object,
+        },
+      });
+      return { status: "needs_check", error: result.message };
+    }
 
-  const finalRows = await prisma.glsSync.findMany({ where: { jobId }, orderBy: { alphaOrderId: "asc" } });
-  const sent = finalRows.filter((row) => row.status === "sent");
-
-  // Fulfill lines GLS accepted (retried on the next run if Shopify fails).
-  const toFulfill = sent.filter((row) => !row.fulfilledAt);
-  if (config.autoFulfill && toFulfill.length) {
-    const names = toFulfill.map((row) => row.glsOrderName).filter(Boolean).join(", ");
-    await fulfillOrderLines(
-      admin,
-      orderGid,
-      toFulfill.map((row) => row.lineItemGid),
-      `Sent to Genetic LifeSpan for fulfillment${names ? ` (GLS order ${names})` : ""}`,
-    );
-    await prisma.glsSync.updateMany({
-      where: { id: { in: toFulfill.map((row) => row.id) } },
-      data: { fulfilledAt: new Date() },
+    sync = await prisma.glsSync.update({
+      where: { id: sync.id },
+      data: {
+        status: "sent",
+        lastError: null,
+        lastStatusCode: result.status,
+        responseBody: result.body as object,
+        glsOrderId: result.glsOrderId,
+        glsOrderName: result.glsOrderName,
+        sentAt: new Date(),
+      },
     });
   }
 
-  if (sent.length) {
-    await setSyncMetafield(
+  // Sent: finish the Shopify side. Each step is safe to repeat if a later one fails.
+  const items = sync.items as unknown as BuiltItem[];
+  if (config.autoFulfill && !sync.fulfilledAt) {
+    await fulfillOrderLines(
       admin,
       orderGid,
-      sent.map((row) => ({
-        alpha_order_id: row.alphaOrderId,
-        product_type: row.productType,
-        quantity: row.quantity,
-        gls_order_id: row.glsOrderId,
-        gls_order_name: row.glsOrderName,
-        sent_at: row.sentAt,
-      })),
+      items.map((item) => item.lineItemId),
+      `Sent to Genetic LifeSpan for fulfillment${sync.glsOrderName ? ` (GLS order ${sync.glsOrderName})` : ""}`,
     );
+    await prisma.glsSync.update({ where: { id: sync.id }, data: { fulfilledAt: new Date() } });
   }
 
-  const failed = finalRows.filter((row) => row.status === "failed");
-  const tags: string[] = [];
-  if (sent.length) tags.push(TAGS.sent);
-  if (finalRows.some((row) => row.status === "dry_run")) tags.push(TAGS.dryRun);
-
-  if (failed.length) {
-    const error = failed.map((row) => `${row.alphaOrderId} (${row.productType}): ${row.lastError}`).join("\n");
-    if (tags.length) await addOrderTags(admin, orderGid, tags);
-    return failed.every((row) => row.retryable)
-      ? { status: "retryable_error", error }
-      : { status: "permanent_error", error };
-  }
-
-  if (tags.length) await addOrderTags(admin, orderGid, tags);
-  return sent.length === finalRows.length ? { status: "done" } : { status: "dry_run" };
+  await setSyncMetafield(admin, orderGid, {
+    alpha_order_id: sync.alphaOrderId,
+    gls_order_id: sync.glsOrderId,
+    gls_order_name: sync.glsOrderName,
+    sent_at: sync.sentAt,
+    test: sync.isTest,
+    items: items.map((item) => ({
+      product_type: item.productType,
+      quantity: item.quantity,
+      unit_price: item.unitPrice,
+    })),
+  });
+  await addOrderTags(admin, orderGid, [TAGS.sent]);
+  return { status: "done" };
 }
 
 async function finishJob(jobId: string, orderName: string | null, attempts: number, outcome: Outcome, config: GlsConfig) {
@@ -241,15 +251,36 @@ async function finishJob(jobId: string, orderName: string | null, attempts: numb
     return;
   }
 
+  if (outcome.status === "needs_check") {
+    await prisma.orderJob.update({
+      where: { id: jobId },
+      data: { status: "needs_check", attempts, lockedAt: null, lastError: outcome.error },
+    });
+    await tagOrder(jobId, TAGS.check);
+    const sync = await prisma.glsSync.findUnique({ where: { jobId } });
+    await sendAlert(
+      `Order ${orderName ?? jobId}: check with Genetic LifeSpan before resending`,
+      [
+        `Genetic LifeSpan did not confirm the order: ${outcome.error}`,
+        `It may or may not have been created on their side. Their API does not dedupe, so it was NOT resent.`,
+        "",
+        `Ask Genetic LifeSpan (rommel.aleman@geneticlifespan.com) whether alpha_order_id ${sync?.alphaOrderId ?? orderName} exists, then in AgeCode Bridge:`,
+        `- it exists: "Mark as sent" (enter their order number)`,
+        `- it doesn't: "Resend"`,
+      ].join("\n"),
+    );
+    return;
+  }
+
   if (outcome.status === "retryable_error" || outcome.status === "permanent_error") {
     await prisma.orderJob.update({
       where: { id: jobId },
       data: { status: "failed", attempts, lockedAt: null, lastError: outcome.error },
     });
-    await tagError(jobId);
+    await tagOrder(jobId, TAGS.error);
     await sendAlert(
       `Order ${orderName ?? jobId} was not sent to Genetic LifeSpan`,
-      `${outcome.error}\n\nOpen AgeCode Bridge in Shopify admin to fix the order and press Retry.`,
+      `${outcome.error}\n\nFix the order in Shopify if needed, then open AgeCode Bridge and press Retry.`,
     );
     return;
   }
@@ -264,12 +295,12 @@ async function finishJob(jobId: string, orderName: string | null, attempts: numb
   }
 }
 
-async function tagError(jobId: string) {
+async function tagOrder(jobId: string, tag: string) {
   try {
     const job = await prisma.orderJob.findUniqueOrThrow({ where: { id: jobId } });
     const { admin } = await unauthenticated.admin(job.shop);
-    await addOrderTags(admin, job.orderGid, [TAGS.error]);
+    await addOrderTags(admin, job.orderGid, [tag]);
   } catch (error) {
-    console.error("Could not tag order with gls-error", error);
+    console.error(`Could not tag order with ${tag}`, error);
   }
 }

@@ -37,8 +37,10 @@ services:
         sync: false
       - key: GLS_CHANNEL_ID
         value: alpha-biomed
-      - key: GLS_PRICE_MODE
-        value: line_total
+      # true = send EVERY order in the test format (TEST- prefix, first name TEST). Normally leave false and
+      # tag individual orders gls-test instead.
+      - key: GLS_TEST_ORDERS
+        value: "false"
       - key: AUTO_FULFILL
         value: "true"
       # Optional failure alerts

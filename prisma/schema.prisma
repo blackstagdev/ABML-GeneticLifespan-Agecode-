@@ -34,14 +34,16 @@ model Session {
 // One job per paid Shopify order. Created by the orders/paid webhook, processed by the worker.
 //
 // status:
-//   pending     - waiting to be processed
-//   processing  - claimed by the worker (lockedAt set)
-//   retry       - a temporary failure; will run again at nextAttemptAt
-//   done        - every AgeCode line was sent to GLS (and fulfilled when AUTO_FULFILL is on)
-//   dry_run     - payloads were built but not sent (GLS_MODE=dry_run)
-//   no_agecode  - the order has no AgeCode line items
-//   cancelled   - the order was cancelled before it could be sent
-//   failed      - needs a person: permanent error or retries used up
+//   pending      - waiting to be processed
+//   processing   - claimed by the worker (lockedAt set)
+//   retry        - nothing reached Genetic LifeSpan yet (Shopify API error, DNS, 429); runs again at nextAttemptAt
+//   done         - sent to Genetic LifeSpan (and fulfilled when AUTO_FULFILL is on)
+//   dry_run      - payload built but not sent (GLS_MODE=dry_run)
+//   needs_check  - GLS answered 5xx / timed out: the order may exist there. Never resent automatically;
+//                  ask Genetic LifeSpan, then "Mark as sent" or "Resend" in the app
+//   no_agecode   - the order has no AgeCode line items
+//   cancelled    - the order was cancelled before it was sent
+//   failed       - needs a person: missing data, GLS 4xx, or retries used up
 model OrderJob {
   id            String    @id @default(cuid())
   shop          String
@@ -54,28 +56,32 @@ model OrderJob {
   lastError     String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
-  lines         GlsSync[]
+  sync          GlsSync?
 
   @@index([status, nextAttemptAt])
   @@index([createdAt])
 }
 
-// One row per AgeCode line item sent (or to be sent) to Genetic LifeSpan.
+// The request sent (or to be sent) to Genetic LifeSpan for one Shopify order.
+// V2 spec: one GLS order per Shopify order; several AgeCode products go in items[].
 //
-// status: pending | sent | dry_run | failed
+// status: pending | sending | sent | dry_run | failed | needs_check
+//   "sending" is saved before the POST, so a crash mid-request can't lead to a duplicate:
+//   a row found in "sending" is treated as needs_check, never resent automatically.
 model GlsSync {
   id             String    @id @default(cuid())
-  jobId          String
+  jobId          String    @unique
   job            OrderJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  orderGid       String
+  orderGid       String    @unique
   orderName      String
-  lineItemGid    String
   alphaOrderId   String
-  productType    String
-  quantity       Int
+  isTest         Boolean   @default(false)
+  // [{ lineItemId, productType, quantity, unitPrice, lineTotal }]
+  items          Json
+  // e.g. "AgeCode Premier ×1, AgeCode Wellness Essentials ×2"
+  summary        String
   pricePaid      Decimal   @db.Decimal(12, 2)
   status         String    @default("pending")
-  retryable      Boolean   @default(true)
   attempts       Int       @default(0)
   lastError      String?
   lastStatusCode Int?
@@ -88,6 +94,5 @@ model GlsSync {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
-  @@unique([orderGid, lineItemGid])
   @@index([sentAt])
 }

@@ -1,15 +1,33 @@
 // HTTP client for the Genetic LifeSpan channel API.
 // POST {apiBase}/api/channels/{channelId}/orders with X-API-Key.
+//
+// The API does not dedupe (V2 spec, section 7):
+//   201          -> created; store order_id/order_name and never resend
+//   4xx          -> nothing was created; fix the payload and send again
+//   5xx/timeout  -> unknown; do NOT retry, ask Genetic LifeSpan whether the alpha_order_id exists
 import type { GlsConfig } from "./config.server";
 import type { GlsPayload } from "./payload";
 
 export type SendResult =
   | { kind: "sent"; status: number; body: unknown; glsOrderId: string; glsOrderName: string }
   | { kind: "dry_run" }
-  | { kind: "error"; status: number | null; body: unknown; message: string; retryable: boolean };
+  // the request never reached GLS (DNS failure, connection refused) or was rate limited: safe to retry
+  | { kind: "not_sent"; status: number | null; body: unknown; message: string }
+  // GLS rejected it (4xx): nothing was created, needs a fix before resending
+  | { kind: "rejected"; status: number; body: unknown; message: string }
+  // 5xx, timeout or dropped connection: the order may or may not exist at GLS
+  | { kind: "unknown"; status: number | null; body: unknown; message: string };
+
+// Network errors that happen before the request is delivered, so nothing can have been created.
+const NOT_DELIVERED_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"]);
 
 export function glsOrdersUrl(config: GlsConfig) {
   return `${config.apiBase}/api/channels/${encodeURIComponent(config.channelId)}/orders`;
+}
+
+function errorCode(error: unknown): string | undefined {
+  const cause = (error as { cause?: { code?: string } })?.cause;
+  return cause?.code ?? (error as { code?: string })?.code;
 }
 
 export async function sendGlsOrder(
@@ -31,13 +49,11 @@ export async function sendGlsOrder(
       signal: AbortSignal.timeout(config.requestTimeoutMs),
     });
   } catch (error) {
-    return {
-      kind: "error",
-      status: null,
-      body: null,
-      message: `Network error: ${error instanceof Error ? error.message : String(error)}`,
-      retryable: true,
-    };
+    const code = errorCode(error);
+    const message = `Network error${code ? ` (${code})` : ""}: ${error instanceof Error ? error.message : String(error)}`;
+    return code && NOT_DELIVERED_CODES.has(code)
+      ? { kind: "not_sent", status: null, body: null, message }
+      : { kind: "unknown", status: null, body: null, message };
   }
 
   const text = await response.text();
@@ -59,24 +75,16 @@ export async function sendGlsOrder(
     };
   }
 
-  const message =
+  const reason =
     typeof json.error === "string"
       ? json.error
       : `Unexpected response ${response.status}${text ? `: ${text.slice(0, 300)}` : ""}`;
+  const message = json.details ? `${reason} ${JSON.stringify(json.details)}` : reason;
 
-  return {
-    kind: "error",
-    status: response.status,
-    body,
-    message: json.details ? `${message} ${JSON.stringify(json.details)}` : message,
-    retryable: isRetryable(response.status, json),
-  };
-}
-
-// 4xx = our payload or key is wrong, retrying won't help.
-// 5xx / 429 = temporary, except a 502 that names bad fields (e.g. { phone: ["is invalid"] }).
-export function isRetryable(status: number, json: Record<string, unknown>) {
-  if (status === 429) return true;
-  if (status === 502 && json.details) return false;
-  return status >= 500;
+  if (response.status === 429) return { kind: "not_sent", status: response.status, body, message };
+  if (response.status >= 400 && response.status < 500) {
+    return { kind: "rejected", status: response.status, body, message };
+  }
+  // 5xx, or a 2xx/3xx we don't understand: we can't tell whether the order was created.
+  return { kind: "unknown", status: response.status, body, message };
 }
