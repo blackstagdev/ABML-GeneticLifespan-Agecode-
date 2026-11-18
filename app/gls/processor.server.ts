@@ -34,6 +34,9 @@ export async function enqueueOrder(shop: string, orderGid: string, orderName?: s
 // `resend` is only for orders Genetic LifeSpan confirmed they don't have (needs_check).
 export async function requeueJob(jobId: string, { resend = false } = {}) {
   const sync = await prisma.glsSync.findUnique({ where: { jobId } });
+  if (sync?.cancelStatus === "cancelled") {
+    throw new Error("This order was cancelled at Genetic LifeSpan. Place a new order instead.");
+  }
   if (sync && sync.status !== "sent") {
     if (["needs_check", "sending"].includes(sync.status) && !resend) {
       throw new Error("This order may already exist at Genetic LifeSpan. Confirm with them first.");

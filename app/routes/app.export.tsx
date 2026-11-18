@@ -37,6 +37,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         gls_order_name: sync.glsOrderName,
         gls_order_id: sync.glsOrderId,
         fulfilled_in_shopify: sync.fulfilledAt ? "yes" : "no",
+        cancelled_at_gls_utc: sync.cancelStatus === "cancelled" ? sync.cancelledAt?.toISOString() : "",
       })),
     ),
   };

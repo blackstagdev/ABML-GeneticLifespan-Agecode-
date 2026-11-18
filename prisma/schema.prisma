@@ -91,6 +91,12 @@ model GlsSync {
   glsOrderName   String?
   sentAt         DateTime?
   fulfilledAt    DateTime?
+  // V3 cancel endpoint: null | requested | cancelled | shipped | not_found | needs_check | failed
+  cancelStatus   String?
+  cancelReason   String?
+  cancelError    String?
+  cancelResponse Json?
+  cancelledAt    DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 

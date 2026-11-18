@@ -2,13 +2,21 @@ import type { ActionFunctionArgs } from "react-router";
 import { getGlsConfig, MOCK_API_KEY } from "../gls/config.server";
 import { GLS_PRODUCT_TYPES } from "../gls/payload";
 
-// Stand-in for POST https://gls-channel-api.geneticlifespan.com/api/channels/alpha-biomed/orders (V2 spec)
+// Stand-in for POST https://gls-channel-api.geneticlifespan.com/api/channels/alpha-biomed/orders (V3 spec)
 // Only active when GLS_MODE=mock. Validates like the spec and returns the documented responses.
 // Put "+fail500", "+fail400" or "+fail502" in the customer email to simulate errors.
 const json = (body: unknown, status: number) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
 let mockOrderNumber = 1000;
+
+// alpha_order_id -> mock order, used by the mock cancel endpoint (orders_.cancel)
+type MockOrder = { order_id: number; order_name: string; cancelled_at: string | null };
+declare global {
+  // eslint-disable-next-line no-var
+  var agecodeMockOrders: Map<string, MockOrder> | undefined;
+}
+export const mockOrders: Map<string, MockOrder> = (global.agecodeMockOrders ??= new Map());
 
 type MockItem = { product_type?: string; quantity?: number; unit_price?: number };
 
@@ -72,13 +80,15 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   mockOrderNumber += 1;
+  const created: MockOrder = { order_id: Date.now(), order_name: `#MOCK${mockOrderNumber}`, cancelled_at: null };
+  if (body.alpha_order_id) mockOrders.set(body.alpha_order_id, created);
   return json(
     {
       ok: true,
       channel: params.channel,
-      order_id: Date.now(),
-      order_name: `#MOCK${mockOrderNumber}`,
-      financial_status: "pending",
+      order_id: created.order_id,
+      order_name: created.order_name,
+      financial_status: "paid",
       fulfillment_status: "unfulfilled",
       tags: "alphabiomed_order",
       note: `Channel: ${params.channel} | External order: ${body.alpha_order_id ?? ""}`,

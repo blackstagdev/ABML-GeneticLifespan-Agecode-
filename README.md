@@ -1,8 +1,8 @@
 # AgeCode Bridge
 
 A Shopify custom app for **Alpha BioMed Labs**. When a provider pays for an AgeCode test on
-alphabiomedlabs.com, the app sends the order to **Genetic LifeSpan's channel API** (spec **V2,
-10/23/2026**). Genetic LifeSpan then ships the kit and handles registration, consent and lab work.
+alphabiomedlabs.com, the app sends the order to **Genetic LifeSpan's channel API** (spec **V3,
+11/13/2026**). Genetic LifeSpan then ships the kit and handles registration, consent and lab work.
 
 ```
 Shopify checkout (paid) ──orders/paid webhook──▶ AgeCode Bridge (Render)
@@ -127,7 +127,7 @@ See [.env.example](.env.example) for the full list. The main ones:
    Male/Female conversion, the test format, missing data, and the never-resend rules.
 2. **Dry run (default):** place a test order. The app shows it as `dry_run` with the exact request
    (open **Request** in the Details column). Nothing leaves Shopify.
-3. **Mock API:** set `GLS_MODE=mock`. Orders are POSTed to a fake V2 endpoint inside this app, and
+3. **Mock API:** set `GLS_MODE=mock`. Orders are POSTed to a fake V3 endpoint inside this app, and
    AgeCode items get fulfilled and tagged as in production.
    - To simulate errors, put `+fail500` / `+fail502` (→ `needs_check`) or `+fail400` (→ `failed`)
      in the order email.
@@ -139,16 +139,22 @@ See [.env.example](.env.example) for the full list. The main ones:
 
 ## Day to day
 - **Shopify admin › Apps › AgeCode Bridge:**
-  - order log with Retry / Send / Mark as sent / Resend
+  - order log with Retry / Send / Mark as sent / Resend / Cancel at Genetic LifeSpan
   - "Queue order" by number (e.g. for orders paid before install)
   - **CSV export** for the daily wire reconciliation: one row per product with unit price, line
     total and GLS order number
 - **On the Shopify order:**
-  - tags `gls-sent` / `gls-check` / `gls-error` / `gls-dry-run`
+  - tags `gls-sent` / `gls-check` / `gls-error` / `gls-dry-run` / `gls-cancelled` / `gls-cancel-check`
   - metafield `gls.sync` with the GLS order number and items
   - a fulfillment whose message includes the GLS order number
-- **Cancellations and refunds** of orders already sent trigger an alert only. The GLS API has no
-  cancel endpoint, so contact Genetic LifeSpan.
+- **Cancelling the order in Shopify** also cancels it at Genetic LifeSpan (V3 cancel endpoint), so it
+  doesn't ship. Tag `gls-cancelled` on success. If they already shipped it (409) it's a return: email
+  Genetic LifeSpan. A 502/timeout is never retried automatically (tag `gls-cancel-check`): contact them,
+  then press "Cancel at Genetic LifeSpan" again. Cancelling never refunds the customer.
+- **Refunds** only alert (a refund may be partial; the GLS cancel is for the whole order). If the kit
+  shouldn't ship, press **Cancel at Genetic LifeSpan** on the order in the app.
+- **Tracking:** Genetic LifeSpan emails tracking numbers to the Alpha ops inbox they have on file
+  (no API). They never email the customer.
 - **Support:** Rommel at Genetic LifeSpan, rommel.aleman@geneticlifespan.com.
 
 ## Development
@@ -163,14 +169,14 @@ npm run typecheck && npm run lint
 ```
 
 Code map:
-- `app/gls/payload.ts`: order → GLS V2 payload (pure, tested)
+- `app/gls/payload.ts`: order → GLS payload (pure, tested)
 - `app/gls/client.server.ts`: GLS API client and its result rules
 - `app/gls/processor.server.ts`: send, fulfill, tag, retry / needs_check
 - `app/gls/worker.server.ts`: runs every minute inside the web service
 - `app/gls/shopify-order.server.ts`: Admin GraphQL queries and mutations
 - `app/routes/webhooks.orders.paid.tsx`: queues paid orders
 - `app/routes/app._index.tsx`: admin screen
-- `app/routes/mock.gls.api.channels.$channel.orders.tsx`: fake GLS V2 API (mock mode only)
+- `app/routes/mock.gls.api.channels.$channel.orders.tsx`: fake GLS API (mock mode only; `orders_.cancel` = cancel endpoint)
 
 Not included yet: a Shopify Function that blocks checkout when an AgeCode cart has no phone number.
 Create it with `shopify app generate extension` → *Cart and checkout validation*. Until then, a

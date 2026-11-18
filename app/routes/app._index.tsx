@@ -6,6 +6,7 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getGlsConfig } from "../gls/config.server";
+import { cancelAtGls } from "../gls/cancel.server";
 import { enqueueOrder, markSentManually, requeueJob } from "../gls/processor.server";
 import { findOrderGidByName } from "../gls/shopify-order.server";
 import { processSoon } from "../gls/worker.server";
@@ -19,6 +20,7 @@ const STATUSES = [
   "processing",
   "dry_run",
   "done",
+  "gls_cancelled",
   "no_agecode",
   "cancelled",
 ];
@@ -68,6 +70,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
             glsOrderName: job.sync.glsOrderName,
             fulfilled: Boolean(job.sync.fulfilledAt),
             payload: JSON.stringify(job.sync.requestPayload, null, 2),
+            status: job.sync.status,
+            cancelStatus: job.sync.cancelStatus,
+            cancelError: job.sync.cancelError,
+            cancelledAt: job.sync.cancelledAt?.toISOString() ?? null,
           }
         : null,
     })),
@@ -105,6 +111,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       processSoon(job.id);
       return { ok: true, message: `${job.orderName ?? "Order"} queued` };
     }
+    if (intent === "cancel_gls") {
+      const outcome = await cancelAtGls(job.id, "other", "manual");
+      return { ok: outcome.ok, message: outcome.message };
+    }
     if (intent === "mark_sent") {
       await markSentManually(job.id, String(form.get("glsOrderName") || "").trim());
       processSoon(job.id);
@@ -137,6 +147,7 @@ const MODE_BANNER = {
 
 const STATUS_TONE: Record<string, "success" | "critical" | "warning" | "info" | "neutral"> = {
   done: "success",
+  gls_cancelled: "neutral",
   failed: "critical",
   needs_check: "critical",
   retry: "warning",
@@ -147,7 +158,16 @@ const STATUS_TONE: Record<string, "success" | "critical" | "warning" | "info" | 
   cancelled: "neutral",
 };
 
-const label = (status: string) => status.replace("_", " ");
+const label = (status: string) => status.replace(/_/g, " ");
+
+const CANCEL_TEXT: Record<string, string> = {
+  requested: "Cancel sent, waiting for Genetic LifeSpan",
+  cancelled: "Cancelled at Genetic LifeSpan (will not ship)",
+  shipped: "Cancel refused: already shipped (a return: email Genetic LifeSpan)",
+  not_found: "Cancel: Genetic LifeSpan has no such order",
+  needs_check: "Cancel not confirmed: contact Genetic LifeSpan before trying again",
+  failed: "Cancel rejected",
+};
 
 function toCsv(rows: Record<string, unknown>[]) {
   if (!rows.length) return "";
@@ -168,6 +188,7 @@ export default function Index() {
   const [orderName, setOrderName] = useState("");
   const [glsOrderNames, setGlsOrderNames] = useState<Record<string, string>>({});
   const [confirmResend, setConfirmResend] = useState<string | null>(null);
+  const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
   const today = new Date().toISOString().slice(0, 10);
   const [from, setFrom] = useState(today);
   const [to, setTo] = useState(today);
@@ -293,6 +314,13 @@ export default function Index() {
                           {job.sync.fulfilled ? " · fulfilled in Shopify" : ""}
                         </s-paragraph>
                       ) : null}
+                      {job.sync.cancelStatus ? (
+                        <s-paragraph>
+                          {CANCEL_TEXT[job.sync.cancelStatus] ?? job.sync.cancelStatus}
+                          {job.sync.cancelledAt ? ` (${new Date(job.sync.cancelledAt).toLocaleString()})` : ""}
+                          {job.sync.cancelError && job.sync.cancelStatus !== "cancelled" ? `: ${job.sync.cancelError}` : ""}
+                        </s-paragraph>
+                      ) : null}
                     </>
                   ) : (
                     "—"
@@ -349,6 +377,35 @@ export default function Index() {
                         </s-button>
                       )}
                     </s-stack>
+                  ) : null}
+                  {job.sync &&
+                  ["sent", "needs_check"].includes(job.sync.status) &&
+                  !["cancelled", "shipped", "requested"].includes(job.sync.cancelStatus ?? "") ? (
+                    confirmCancel === job.id ? (
+                      <s-stack gap="small">
+                        <s-paragraph>
+                          Cancels the whole Genetic LifeSpan order so it doesn&apos;t ship. It does not refund the
+                          customer.
+                        </s-paragraph>
+                        <s-button
+                          variant="primary"
+                          tone="critical"
+                          onClick={() => {
+                            setConfirmCancel(null);
+                            submit({ intent: "cancel_gls", jobId: job.id });
+                          }}
+                        >
+                          Yes, cancel at Genetic LifeSpan
+                        </s-button>
+                        <s-button variant="tertiary" onClick={() => setConfirmCancel(null)}>
+                          Keep order
+                        </s-button>
+                      </s-stack>
+                    ) : (
+                      <s-button variant="tertiary" tone="critical" onClick={() => setConfirmCancel(job.id)}>
+                        Cancel at Genetic LifeSpan
+                      </s-button>
+                    )
                   ) : null}
                   {["failed", "retry", "dry_run", "cancelled"].includes(job.status) ? (
                     <s-button variant="secondary" onClick={() => submit({ intent: "retry", jobId: job.id })}>

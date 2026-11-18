@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { glsOrdersUrl, sendGlsOrder } from "./client.server";
+import { cancelGlsOrder, glsCancelReason, glsCancelUrl, glsOrdersUrl, sendGlsOrder } from "./client.server";
 import { getGlsConfig } from "./config.server";
 import type { GlsPayload } from "./payload";
 
@@ -96,5 +96,52 @@ describe("sendGlsOrder", () => {
     expect(await sendGlsOrder(live, payload, respond(201, { ok: false, error: "nope" }))).toMatchObject({
       kind: "unknown",
     });
+  });
+});
+
+describe("cancelGlsOrder (V3 section 11)", () => {
+  const request = { alpha_order_id: "ABM-1001", reason: "customer" as const };
+
+  it("posts to /orders/cancel with the API key and alpha_order_id", async () => {
+    const fetchImpl = respond(200, { ok: true, already_cancelled: false, order_name: "#1005" });
+    expect(await cancelGlsOrder(live, request, fetchImpl)).toMatchObject({ kind: "cancelled", alreadyCancelled: false });
+    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe(glsCancelUrl(live));
+    expect(url).toBe("https://gls-channel-api.geneticlifespan.com/api/channels/alpha-biomed/orders/cancel");
+    expect(init.headers["X-API-Key"]).toBe("secret");
+    expect(JSON.parse(init.body)).toEqual(request);
+  });
+
+  it("reports already_cancelled", async () => {
+    expect(await cancelGlsOrder(live, request, respond(200, { ok: true, already_cancelled: true }))).toMatchObject({
+      kind: "cancelled",
+      alreadyCancelled: true,
+    });
+  });
+
+  it("maps 409 shipped, 404, other 4xx and 502/timeout", async () => {
+    const shipped = { ok: false, error: "Order has already shipped. Cancel is only available before fulfillment." };
+    expect(await cancelGlsOrder(live, request, respond(409, shipped))).toMatchObject({ kind: "shipped" });
+    expect(await cancelGlsOrder(live, request, respond(409, { ok: false, error: "ids do not match" }))).toMatchObject({
+      kind: "rejected",
+    });
+    expect(await cancelGlsOrder(live, request, respond(404, { ok: false, error: "nope" }))).toMatchObject({ kind: "not_found" });
+    expect(await cancelGlsOrder(live, request, respond(401, { ok: false, error: "key" }))).toMatchObject({ kind: "rejected" });
+    expect(await cancelGlsOrder(live, request, respond(502, { ok: false, error: "x" }))).toMatchObject({ kind: "unknown" });
+    const timeout = Object.assign(new Error("timeout"), { name: "TimeoutError" });
+    expect(await cancelGlsOrder(live, request, throws(timeout))).toMatchObject({ kind: "unknown" });
+  });
+
+  it("does nothing in dry run", async () => {
+    const fetchImpl = respond(200, {});
+    expect(await cancelGlsOrder(getGlsConfig({} as NodeJS.ProcessEnv), request, fetchImpl)).toEqual({ kind: "dry_run" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("maps Shopify cancel reasons to customer / declined / other", () => {
+    expect(glsCancelReason("customer")).toBe("customer");
+    expect(glsCancelReason("DECLINED")).toBe("declined");
+    expect(glsCancelReason("fraud")).toBe("other");
+    expect(glsCancelReason(undefined)).toBe("other");
   });
 });
